@@ -48,7 +48,7 @@ jobs:
     - run: pyinstaller --onefile s3_download_ui.py
 
     - name: Upload EXE as artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: s3_download_ui
         path: dist/s3_download_ui.exe
