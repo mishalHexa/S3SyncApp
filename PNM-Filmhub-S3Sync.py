@@ -37,6 +37,24 @@ from pathlib import Path
 
 
 # ---------- Config handling ----------
+# def get_config_path():
+#     if sys.platform.startswith("win"):
+#         appdata = os.getenv("APPDATA") or os.path.expanduser("~")
+#         pnmfolder = os.path.join(appdata, "pnm_filmhub_s3")
+#         return os.path.join(pnmfolder, "pnm_filmhub_s3_sync_config.json")
+#     else:
+#         pnmfolder = os.path.join(os.path.expanduser("~"), ".pnm_filmhub_s3")
+#         return os.path.join(pnmfolder, ".pnm_filmhub_s3_sync_config.json")
+
+# def get_save_file_path():
+#     if sys.platform.startswith("win"):
+#         appdata = os.getenv("APPDATA") or os.path.expanduser("~")
+#         pnmfolder = os.path.join(appdata, "pnm_filmhub_s3")
+#         return os.path.join(pnmfolder, "pnm_filmhub_s3_sync_config.json")
+#     else:
+#         pnmfolder = os.path.join(os.path.expanduser("~"), ".pnm_filmhub_s3")
+#         return os.path.join(pnmfolder, ".pnm_filmhub_s3_sync_config.json")
+
 def get_config_path():
     if sys.platform.startswith("win"):
         appdata = os.getenv("APPDATA") or os.path.expanduser("~")
@@ -66,6 +84,15 @@ def load_config():
         except Exception:
             return DEFAULT_CONFIG.copy()
     return DEFAULT_CONFIG.copy()
+
+# def save_file_store_info(cfg):
+#     path = get_config_path()
+#     try:
+#         with open(path, "w", encoding="utf-8") as f:
+#             json.dump(cfg, f, indent=2)
+#         return True
+#     except Exception:
+#         return False
 
 def save_config(cfg):
     path = get_config_path()
@@ -974,7 +1001,6 @@ class S3SyncApp(tk.Tk):
                 for key in keys:
                     if self.stop_event.is_set():
                         if self.stop_flags.get(pref, False):
-                            print("Stopped sync for ",pref)
                             self.log(f"Stopped sync for {pref}")
                             self.queue.put(("status", pref, "stopped"))
                             continue
@@ -1006,8 +1032,12 @@ class S3SyncApp(tk.Tk):
                         local_dir = os.path.dirname(local_full_path)
                         os.makedirs(local_dir, exist_ok=True)
                         try:
-                            self.queue.put(("log", f"Download Start for: {local_full_path}"))
-                            s3_client.download_file(bucket, key, local_full_path)
+                            if not os.path.exists(local_full_path):
+                                self.queue.put(("log", f"Download Start for: {local_full_path}"))
+                                s3_client.download_file(bucket, key, local_full_path)
+                            else:
+                                self.queue.put(("log", f"Skipped Already Downloaded for: {local_full_path}"))
+                            
                         except Exception as e:
                             # log error but continue
                             self.queue.put(("log", f"[{pref}] failed to download {key}: {e}"))
@@ -1019,7 +1049,6 @@ class S3SyncApp(tk.Tk):
 
                 if not self.stop_event.is_set():
                     if not self.stop_flags.get(pref, False):
-                        print("settting complegte for ",pref)
                         self.queue.put(("log", f"[{pref}] Completed."))
                         self.queue.put(("status", pref, "completed"))
 
@@ -1135,7 +1164,6 @@ class S3SyncApp(tk.Tk):
             return
         item = info["item"]
         status = info.get("status", "")
-        print("log status : ",status)
         self.tree.item(item, tags=(status,))
 
     def poll_queue(self):
