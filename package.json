@@ -1,0 +1,22 @@
+{
+  "name": "s3syncapp",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "pyinstaller --onefile --windowed --name PNM-Filmhub-S3Sync PNM-Filmhub-S3Sync.py --noconfirm",
+    "treeview": "pyinstaller --onefile --windowed tree_checkbox.py --noconfirm",
+    "loader": "pyinstaller --onefile --windowed loader.py --noconfirm",
+    "open": "open dist/PNM"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mishalHexa/S3SyncApp.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/mishalHexa/S3SyncApp/issues"
+  },
+  "homepage": "https://github.com/mishalHexa/S3SyncApp#readme"
+}

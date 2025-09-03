@@ -45,10 +45,10 @@ jobs:
         python-version: '3.10'
 
     - run: pip install pyinstaller
-    - run: pyinstaller --onefile s3_download_ui.py
+    - run: npm run build
 
     - name: Upload EXE as artifact
       uses: actions/upload-artifact@v4
       with:
         name: s3_download_ui
-        path: dist/s3_download_ui.exe
+        path: dist/PNM-Filmhub-S3Sync.exe

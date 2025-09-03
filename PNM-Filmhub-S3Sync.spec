@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['s3_sync_gui.py'],
+    ['PNM-Filmhub-S3Sync.py'],
     pathex=[],
     binaries=[],
     datas=[],
