@@ -46,6 +46,7 @@ jobs:
 
     - run: pip install pyinstaller
     - run: pip install pandas
+    - run: pip install boto3 botocore
     - run: npm run build
 
     - name: Upload EXE as artifact
