@@ -1,17 +1,20 @@
 """
-s3_sync_gui.py
+PNM-Filmhub-S3Sync.py
 Windows-only Python desktop app (Tkinter) for listing top-level S3 prefixes and syncing them
 to a local target path. Uses boto3.
 
 Requirements:
     pip install boto3
+    pip install pyinstaller
+    pip install botocore
+    pip install pandas
 
 How to run (on Windows):
-    python s3_sync_gui.py
+    python3 PNM-Filmhub-S3Sync.py
 
 To build .exe (on Windows) with PyInstaller:
     pip install pyinstaller
-    pyinstaller --onefile --windowed s3_sync_gui.py
+    pyinstaller --onefile --windowed PNM-Filmhub-S3Sync.py
 """
 
 import os
@@ -37,9 +40,9 @@ from pathlib import Path
 def get_config_path():
     if sys.platform.startswith("win"):
         appdata = os.getenv("APPDATA") or os.path.expanduser("~")
-        return os.path.join(appdata, "s3_sync_config.json")
+        return os.path.join(appdata, "pnm_filmhub_s3_sync_config.json")
     else:
-        return os.path.join(os.path.expanduser("~"), ".s3_sync_config.json")
+        return os.path.join(os.path.expanduser("~"), ".pnm_filmhub_s3_sync_config.json")
 
 DEFAULT_CONFIG = {
     "target_path": "",
@@ -47,7 +50,8 @@ DEFAULT_CONFIG = {
     "aws_secret_access_key": "",
     "endpoint_url": "",
     "region_name": "",
-    "bucket_name": ""
+    "bucket_name": "",
+    "include_mp4": True
 }
 
 def load_config():
@@ -101,7 +105,7 @@ def list_top_level_prefixes(s3_client, bucket):
     except ClientError as e:
         raise
 
-def list_objects_for_prefix(s3_client, bucket, prefix):
+def list_objects_for_prefix(self, s3_client, bucket, prefix):
     """Return list of object keys under a prefix (recursive)."""
     keys = []
     paginator = s3_client.get_paginator("list_objects_v2")
@@ -115,7 +119,7 @@ def list_objects_for_prefix(s3_client, bucket, prefix):
                 if key.endswith("/"):
                     continue
 
-                if key.endswith(".mp4"):
+                if key.endswith(".mp4") and not self.cfg["include_mp4"]:
                     continue
 
                 # 🚨 Skip hidden files/folders (start with a dot after the prefix)
@@ -476,7 +480,7 @@ class S3SyncApp(tk.Tk):
         self.region_var = tk.StringVar(value=self.cfg.get("region_name", ""))
         ttk.Entry(frm, textvariable=self.region_var, width=60).grid(row=3, column=1, columnspan=2, sticky=tk.W)
 
-        # Region
+        # Endpoint Url
         ttk.Label(frm, text="Endpoint Url:").grid(row=4, column=0, sticky=tk.W, pady=pad)
         self.endpoint_var = tk.StringVar(value=self.cfg.get("endpoint_url", ""))
         ttk.Entry(frm, textvariable=self.endpoint_var, width=60).grid(row=4, column=1, columnspan=2, sticky=tk.W)
@@ -486,15 +490,22 @@ class S3SyncApp(tk.Tk):
         self.bucket_var = tk.StringVar(value=self.cfg.get("bucket_name", ""))
         ttk.Entry(frm, textvariable=self.bucket_var, width=60).grid(row=5, column=1, columnspan=2, sticky=tk.W)
 
+        # Include mp4
+        ttk.Label(frm, text="Sync MP4:").grid(row=6, column=0, sticky=tk.W, pady=pad)
+        # self.include_mp4_var = tk.StringVar(value=self.cfg.get("include_mp4", ""))
+        # ttk.Entry(frm, textvariable=self.include_mp4_var, width=60).grid(row=6, column=1, columnspan=2, sticky=tk.W)
+        self.include_mp4_var = tk.BooleanVar(value=self.cfg.get("include_mp4", True))
+        ttk.Checkbutton(frm, text="Include .mp4 files", variable=self.include_mp4_var).grid(row=6, column=1, columnspan=2, sticky=tk.W)
+
         # Save / Test buttons
         btn_frame = ttk.Frame(frm)
-        btn_frame.grid(row=6, column=0, columnspan=3, pady=(12,0))
+        btn_frame.grid(row=7, column=0, columnspan=3, pady=(12,0))
         ttk.Button(btn_frame, text="Save", command=self.save_settings).pack(side=tk.LEFT)
         ttk.Button(btn_frame, text="Test & List Prefixes", command=self.test_list_prefixes).pack(side=tk.LEFT, padx=8)
         ttk.Button(btn_frame, text="Reload config", command=self.reload_config).pack(side=tk.LEFT, padx=8)
 
         # small note
-        ttk.Label(parent, text="Config saved to: " + get_config_path(), font=("Segoe UI", 8)).pack(anchor=tk.W, padx=12, pady=(6,0))
+        ttk.Label(parent, text="Config saved to: " + get_config_path(), font=("Segoe UI", 12)).pack(anchor=tk.W, padx=12, pady=(6,0))
 
     def browse_target(self):
         d = filedialog.askdirectory()
@@ -508,6 +519,7 @@ class S3SyncApp(tk.Tk):
         self.cfg["region_name"] = self.region_var.get().strip()
         self.cfg["endpoint_url"] = self.endpoint_var.get().strip()
         self.cfg["bucket_name"] = self.bucket_var.get().strip()
+        self.cfg["include_mp4"] = self.include_mp4_var.get()
 
         ok = save_config(self.cfg)
         if ok:
@@ -525,6 +537,7 @@ class S3SyncApp(tk.Tk):
         self.aws_secret_var.set(self.cfg.get("aws_secret_access_key", ""))
         self.endpoint_var.set(self.cfg.get("endpoint_url", ""))
         self.bucket_var.set(self.cfg.get("bucket_name", ""))
+        self.include_mp4_var.set(self.cfg.get("include_mp4", ""))
         messagebox.showinfo("Reloaded", "Configuration reloaded.")
 
     def test_list_prefixes(self):
@@ -580,25 +593,27 @@ class S3SyncApp(tk.Tk):
         ttk.Button(topframe, text="Start Sync Selected", command=lambda: self.start_sync(selected_only=True)).pack(side=tk.LEFT, padx=6)
         ttk.Button(topframe, text="Stop Sync Selected", command=lambda: self.stop_sync(selected_only=True)).pack(side=tk.LEFT)
 
-        try:
-            tk.Label(topframe, text="Filter by status:").pack(side="left", padx=5)
+        # try:
+        #     tk.Label(topframe, text="Filter by status:").pack(side="left", padx=5)
 
-            self.status_filter = tk.StringVar(value="all")
-            status_options = ["all", "pending", "downloading", "completed", "error"]
+        #     self.status_filter = tk.StringVar(value="all")
+        #     status_options = ["all", "pending", "downloading", "completed", "error"]
 
-            ttk.OptionMenu(topframe, self.status_filter, "all", *status_options,
-                        command=lambda _: self.filter_by_status(self.status_filter.get())
-            ).pack(side="left", padx=5)
-        except Exception as e:
-            self.queue.put(("log", f"error during filter: {e}"))
+        #     ttk.OptionMenu(topframe, self.status_filter, "all", *status_options,
+        #                 command=lambda _: self.filter_by_status(self.status_filter.get())
+        #     ).pack(side="left", padx=5)
+        # except Exception as e:
+        #     self.queue.put(("log", f"error during filter: {e}"))
 
         # Treeview
         cols = ("s3_folder", "local_folder", "progress", "action")
         self.tree = ttk.Treeview(parent, columns=cols, show="headings", height=15)
+        # self.tree.heading("item_selected", text="Select")
         self.tree.heading("s3_folder", text="S3 Folder (prefix)")
         self.tree.heading("local_folder", text="Local Folder Name")
         self.tree.heading("progress", text="Progress (downloaded/total)")
         self.tree.heading("action", text="Action")
+        # self.tree.column("item_selected", width=40, anchor=tk.W)
         self.tree.column("s3_folder", width=360, anchor=tk.W)
         self.tree.column("local_folder", width=240, anchor=tk.W)
         self.tree.column("progress", width=160, anchor=tk.CENTER)
@@ -606,22 +621,26 @@ class S3SyncApp(tk.Tk):
         self.tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0,8))
 
         style = ttk.Style()
-        style.configure("Pending.Treeview", background="#808080", foreground="#FFFFFF")  
-        style.configure("Downloading.Treeview", background="#E89149", foreground="#FFFFFF")  
-        style.configure("Stopped.Treeview", background="#FF474C", foreground="#FFFFFF")  
-        style.configure("Completed.Treeview", background="#90EE90", foreground="#000000")    
+        style.configure("Pending.Treeview", background="#FFD700", foreground="#000000")  
+        style.configure("Downloading.Treeview", background="#1E90FF", foreground="#FFFFFF")  
+        style.configure("Stopped.Treeview", background="#B22222", foreground="#FFFFFF")  
+        style.configure("Completed.Treeview", background="#228B22", foreground="#FFFFFF")    
+        style.configure("Skipped.Treeview", background="#D3D3D3", foreground="#000000")    
+        style.configure("PartialDone.Treeview", background="#FF8C00", foreground="#000000")    
 
-        self.tree.tag_configure("pending", background="#808080", foreground="#FFFFFF") 
-        self.tree.tag_configure("downloading", background="#E89149", foreground="#FFFFFF") 
-        self.tree.tag_configure("stopped", background="#FF474C", foreground="#FFFFFF") 
-        self.tree.tag_configure("completed", background="#90EE90", foreground="#000000")  
+        self.tree.tag_configure("pending", background="#FFD700", foreground="#000000") 
+        self.tree.tag_configure("downloading", background="#1E90FF", foreground="#FFFFFF") 
+        self.tree.tag_configure("stopped", background="#B22222", foreground="#FFFFFF") 
+        self.tree.tag_configure("completed", background="#228B22", foreground="#FFFFFF")  
+        self.tree.tag_configure("skipped", background="#D3D3D3", foreground="#000000")  
+        self.tree.tag_configure("paritaldone", background="#FF8C00", foreground="#000000")  
 
         # allow selecting multiple
         self.tree.configure(selectmode="extended")
 
         # double click on local_folder to edit
         self.tree.bind("<Double-1>", self.on_tree_double_click)
-        # self.tree.bind("<Double-1>", self.on_tree_double_click)
+        # self.tree.bind("<Button-1>", self.on_click)
 
         # mapping dict for progress and local folder names
         self.prefix_rows = {}  # prefix -> {"item": tree_item_id, "local_name": str, "downloaded": int, "total": int}
@@ -666,7 +685,27 @@ class S3SyncApp(tk.Tk):
                 messagebox.showerror("Error", "Set target path in Settings first.")
                 return
             full_path = os.path.join(target_path, local_name)
+            
             self.open_folder(full_path)
+
+    # def on_click(self, event):
+    #     """Toggle checkbox on single-click in checkbox column."""
+    #     region = self.tree.identify("region", event.x, event.y)
+    #     if region != "cell":
+    #         return
+    #     col = self.tree.identify_column(event.x)
+    #     row = self.tree.identify_row(event.y)
+    #     if not row:
+    #         return
+    #     col_num = int(col.replace("#",""))
+    #     if col_num == 1:
+    #         prefix = self.tree.item(row, "values")[1]
+    #         item_selected = self.prefix_rows[prefix]["item_selected"]
+    #         item_selected = not item_selected
+    #         self.prefix_rows[prefix]["item_selected"] = item_selected
+    #         new_text = "[✓]" if item_selected else "[   ]"
+    #         self.tree.set(row, "item_selected", new_text)
+
 
     def open_folder(self, path):
         if not os.path.exists(path):
@@ -692,6 +731,7 @@ class S3SyncApp(tk.Tk):
         # Capture config safely
         self.cfg.update({
             "bucket_name": self.bucket_var.get().strip(),
+            "include_mp4": self.include_mp4_var.get(),
             "aws_access_key_id": self.aws_access_var.get().strip(),
             "aws_secret_access_key": self.aws_secret_var.get().strip(),
             "region_name": self.region_var.get().strip(),
@@ -722,7 +762,7 @@ class S3SyncApp(tk.Tk):
             for pref in prefixes:
                 try:
                     default_local = pref.rstrip("/").split("/")[-1] or pref.rstrip("/")
-                    keys = list_objects_for_prefix(s3_client, self.cfg["bucket_name"], pref)
+                    keys = list_objects_for_prefix(self, s3_client, self.cfg["bucket_name"], pref)
                     total = len(keys)
 
                     # Check for CSV and parse it here (background thread) to avoid blocking UI
@@ -787,6 +827,7 @@ class S3SyncApp(tk.Tk):
             )
             self.prefix_rows[row["prefix"]] = {
                 "item": item,
+                # "item_selected": False,
                 "local_name": local_name,
                 "downloaded": 0,
                 "csv_parsed": csv_parsed,
@@ -801,8 +842,8 @@ class S3SyncApp(tk.Tk):
         self.status.config(text="Done!")
 
     # ---- Sync logic ----
-    def filter_by_status(self, status: str):
-        """Filter Treeview rows by status ('all', 'pending', 'downloading', 'completed', 'error')."""
+    # def filter_by_status(self, status: str):
+    #     """Filter Treeview rows by status ('all', 'pending', 'downloading', 'completed', 'error')."""
         
         # Clear all current rows in Treeview
         # for iid in self.tree.get_children():
@@ -853,6 +894,7 @@ class S3SyncApp(tk.Tk):
         # Reset counters
         for p in prefixes:
             self.prefix_rows[p]["downloaded"] = 0
+            # self.prefix_rows[p]["item_selected"] = False
             # self.prefix_rows[p]["total"] = 0
             self.prefix_rows[p]["status"] = "pending"
             self.update_tree_progress(p)
@@ -896,12 +938,14 @@ class S3SyncApp(tk.Tk):
             self.progress.config(mode="indeterminate")
             self.progress.start(10)   
             # First compute total counts
-            # for pref in prefixes:
-            #     if self.stop_event.is_set():
-            #         if self.stop_flags.get(pref, False):
-            #             self.log(f"Stopped sync for {pref}")
-            #             self.queue.put(("status", pref, "stopped"))
-            #             continue
+            for pref in prefixes:
+                if self.stop_event.is_set():
+                    if self.stop_flags.get(pref, False):
+                        self.log(f"Stopped sync for {pref}")
+                        self.queue.put(("status", pref, "stopped"))
+                        continue
+                self.queue.put(("log", f"[{pref}] Pending."))
+                self.queue.put(("status", pref, "pending"))
             #     try:
             #         keys = list_objects_for_prefix(s3_client, bucket, pref)
             #         total = len(keys)
@@ -924,12 +968,13 @@ class S3SyncApp(tk.Tk):
                 if total == 0:
                     self.queue.put(("log", f"[{pref}] no files to download. {self.prefix_rows[pref]}"))
                     continue
-                keys = list_objects_for_prefix(s3_client, bucket, pref)
+                keys = list_objects_for_prefix(self, s3_client, bucket, pref)
                 self.queue.put(("status", pref, "downloading"))
                 filter_file_mappings = self.prefix_rows[pref]["filter_file_mappings"]
                 for key in keys:
                     if self.stop_event.is_set():
                         if self.stop_flags.get(pref, False):
+                            print("Stopped sync for ",pref)
                             self.log(f"Stopped sync for {pref}")
                             self.queue.put(("status", pref, "stopped"))
                             continue
@@ -939,8 +984,8 @@ class S3SyncApp(tk.Tk):
                     # Skip "folders" (keys ending with '/')
                     if key.endswith("/"):
                         continue
-                    
-                    if key.endswith(".mp4"):
+
+                    if key.endswith(".mp4") and not self.cfg["include_mp4"]:
                         continue
 
                     # 🚨 Skip hidden files/folders (start with a dot after the prefix)
@@ -971,8 +1016,12 @@ class S3SyncApp(tk.Tk):
                         self.prefix_rows[pref]["downloaded"] += 1
                         downloaded = self.prefix_rows[pref]["downloaded"]
                         self.queue.put(("progress", pref, downloaded))
-                self.queue.put(("log", f"[{pref}] Completed."))
-                self.queue.put(("status", pref, "completed"))
+
+                if not self.stop_event.is_set():
+                    if not self.stop_flags.get(pref, False):
+                        print("settting complegte for ",pref)
+                        self.queue.put(("log", f"[{pref}] Completed."))
+                        self.queue.put(("status", pref, "completed"))
 
 
             self.queue.put(("log", "All sync tasks completed."))
@@ -1086,7 +1135,7 @@ class S3SyncApp(tk.Tk):
             return
         item = info["item"]
         status = info.get("status", "")
-        # self.queue.put(("log", "status : "+status))
+        print("log status : ",status)
         self.tree.item(item, tags=(status,))
 
     def poll_queue(self):
