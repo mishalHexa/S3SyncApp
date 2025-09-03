@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "build": "pyinstaller --onefile --windowed --name PNM-Filmhub-S3Sync PNM-Filmhub-S3Sync.py --noconfirm",
+    "build": "pyinstaller --onefile --windowed --hidden-import pandas --hidden-import pandas._libs.tslibs.np_datetime --hidden-import pandas._libs.tslibs.nattype --hidden-import pandas._libs.skiplist --name PNM-Filmhub-S3Sync PNM-Filmhub-S3Sync.py --noconfirm",
     "treeview": "pyinstaller --onefile --windowed tree_checkbox.py --noconfirm",
     "loader": "pyinstaller --onefile --windowed loader.py --noconfirm",
     "open": "open dist/PNM"
