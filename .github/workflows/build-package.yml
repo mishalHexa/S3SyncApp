@@ -45,10 +45,11 @@ jobs:
         python-version: '3.10'
 
     - run: pip install pyinstaller
+    - run: pip install pandas
     - run: npm run build
 
     - name: Upload EXE as artifact
       uses: actions/upload-artifact@v4
       with:
-        name: s3_download_ui
+        name: pnm_s3_sync
         path: dist/PNM-Filmhub-S3Sync.exe
