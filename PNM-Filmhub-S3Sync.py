@@ -1,0 +1,1140 @@
+"""
+s3_sync_gui.py
+Windows-only Python desktop app (Tkinter) for listing top-level S3 prefixes and syncing them
+to a local target path. Uses boto3.
+
+Requirements:
+    pip install boto3
+
+How to run (on Windows):
+    python s3_sync_gui.py
+
+To build .exe (on Windows) with PyInstaller:
+    pip install pyinstaller
+    pyinstaller --onefile --windowed s3_sync_gui.py
+"""
+
+import os
+import sys
+import subprocess
+import json
+import csv 
+import pandas as pd
+import re
+import threading
+import queue
+from datetime import datetime
+import traceback
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError, BotoCoreError
+import tkinter as tk
+from tkinter import ttk, filedialog, simpledialog, messagebox, scrolledtext
+from pathlib import Path
+
+
+
+# ---------- Config handling ----------
+def get_config_path():
+    if sys.platform.startswith("win"):
+        appdata = os.getenv("APPDATA") or os.path.expanduser("~")
+        return os.path.join(appdata, "s3_sync_config.json")
+    else:
+        return os.path.join(os.path.expanduser("~"), ".s3_sync_config.json")
+
+DEFAULT_CONFIG = {
+    "target_path": "",
+    "aws_access_key_id": "",
+    "aws_secret_access_key": "",
+    "endpoint_url": "",
+    "region_name": "",
+    "bucket_name": ""
+}
+
+def load_config():
+    path = get_config_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                cfg = DEFAULT_CONFIG.copy()
+                cfg.update(data)
+                return cfg
+        except Exception:
+            return DEFAULT_CONFIG.copy()
+    return DEFAULT_CONFIG.copy()
+
+def save_config(cfg):
+    path = get_config_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+# ---------- S3 helpers ----------
+def make_s3_client(cfg):
+    # Create boto3 client with provided credentials
+    return boto3.client(
+        "s3",
+        aws_access_key_id=cfg.get("aws_access_key_id"),
+        aws_secret_access_key=cfg.get("aws_secret_access_key"),
+        region_name=cfg.get("region_name") or None,
+        endpoint_url=cfg.get("endpoint_url") or None,
+    )
+
+def list_top_level_prefixes(s3_client, bucket):
+    """
+    Return list of top level prefixes (like folders) for the bucket.
+    Uses delimiter='/' and Prefix='' to get CommonPrefixes.
+    """
+    prefixes = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    try:
+        for page in paginator.paginate(Bucket=bucket, Delimiter='/'):
+            cps = page.get("CommonPrefixes") or []
+            for cp in cps:
+                prefix = cp.get("Prefix")
+                if prefix:
+                    prefixes.append(prefix)  # includes trailing '/'
+        return sorted(prefixes)
+    except ClientError as e:
+        raise
+
+def list_objects_for_prefix(s3_client, bucket, prefix):
+    """Return list of object keys under a prefix (recursive)."""
+    keys = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        contents = page.get("Contents") or []
+        for obj in contents:
+            # skip "folder objects" that equal prefix (optional)
+            key = obj.get("Key")
+            if key:
+                # Skip "folders" (keys ending with '/')
+                if key.endswith("/"):
+                    continue
+
+                if key.endswith(".mp4"):
+                    continue
+
+                # 🚨 Skip hidden files/folders (start with a dot after the prefix)
+                relative_path = os.path.relpath(key, prefix)
+                if relative_path.startswith("."):
+                    continue
+
+                keys.append(key)
+    return keys
+
+def get_csv_for_prefix(s3_client, bucket, prefix):
+    """Return list of object keys under a prefix (recursive)."""
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        contents = page.get("Contents") or []
+        for obj in contents:
+            # skip "folder objects" that equal prefix (optional)
+            key = obj.get("Key")
+            if key:
+                # Skip "folders" (keys ending with '/')
+                if key.endswith("/"):
+                    continue
+
+                # 🚨 Skip hidden files/folders (start with a dot after the prefix)
+                relative_path = os.path.relpath(key, prefix)
+                if relative_path.startswith("."):
+                    continue
+                
+                if key.endswith(".csv"):
+                    return key
+    return None
+
+def normalize_title(text: str, seperator: str='.') -> str:
+    """
+    Normalize a single column name with custom rules:
+    - Convert to lowercase
+    - Remove apostrophes (colons like Star's -> Stars)
+    - Replace spaces and special characters (excluding parentheses) with '.'
+    - Collapse multiple '..' into single '.'
+    - Strip leading/trailing '.'
+    """
+    s = str(text).strip().lower()
+
+    # Remove apostrophes
+    s = s.replace("'", "")
+
+    # Replace all special chars (except parentheses) with '.'
+    s = re.sub(r'[^0-9a-z()]+', seperator, s)
+
+    # Collapse multiple dots
+    s = re.sub(r'\.+', seperator, s)
+
+    # Remove leading/trailing dots
+    s = s.strip('.')
+
+    return s
+
+def normalize_series_episode(series_title: str, episode_title: str,
+                             season_number: int, episode_number: int) -> str:
+    """
+    Normalize a series episode filename using rules:
+    - Series title uses movie rules
+    - Episode title uses movie rules (no year stripping needed, handled upstream)
+    - Append: .sXXeYY.
+    - Season/episode padded with 2 digits if < 10
+    """
+    # normalize
+    series_norm = normalize_title(series_title)
+    episode_norm = normalize_title(episode_title)
+
+    # pad season & episode
+    season_str = f"s{season_number:02d}"
+    episode_str = f"e{episode_number:02d}"
+
+    return f"{series_norm}.{season_str}{episode_str}.{episode_norm}"
+
+def normalize_cols(cols, seperator) -> list:
+    """
+    Normalize a list of column names
+    """
+    return [normalize_title(c, seperator) for c in cols]
+
+def extract_language(filename: str) -> str:
+    """
+    Try to extract language code from subtitle filename (e.g. '_en.srt' -> 'en').
+    Defaults to 'und' (undefined) if not found.
+    """
+    match = re.search(r"_([a-z]{2,3})\.srt$", filename)
+    return match.group(1) if match else "und"
+
+def build_mappings_list(self, rows: list) -> list:
+    """
+    Build mappings for multiple CSV rows.
+    Each row is a dict of metadata.
+    Returns a list of unique {original, new} mappings.
+    """
+    mappings = []
+    seen = set()  # keep track of unique originals
+    
+
+    for row in rows:
+        # --- Movie ---
+        lang_seen = set()  # keep track of unique originals
+        if row.get("program_type", "").lower() == "movie":
+            title = row.get("movie_show_title", "")
+           
+            year = row.get("production_year", "")
+            base = normalize_title(f"{title}.({year})")
+
+            # Film
+            original = row.get("movie_filename", "")
+           
+            if original and original not in seen:
+                mappings.append({"original": original, "new": f"{base}.mp4"})
+                seen.add(original)
+
+            # Trailer
+            trailer = row.get("trailer_filename", "")
+            if trailer and trailer not in seen:
+                mappings.append({"original": trailer, "new": f"{base}-trailer.mp4"})
+                seen.add(trailer)
+
+            # Posters
+            for key, suffix in [
+                ("key_art_16_9_filename", "-poster.(16x9).jpg"),
+                ("key_art_2_3_filename", "-poster.(2x3).jpg"),
+                ("key_art_3_4_filename", "-poster.(3x4).jpg"),
+            ]:
+                original = row.get(key, "")
+                if original and original not in seen:
+                    mappings.append({"original": original, "new": f"{base}{suffix}"})
+                    seen.add(original)
+
+            # Subtitles (comma-separated list)
+            subs = row.get("movie_subtitles_captions_filenames", "")
+            for sub in [s.strip() for s in subs.split(",") if s.strip()]:
+                if sub not in seen:
+                    lang = extract_language(sub)
+                    mappings.append({"original": sub, "new": f"{base}.{lang}.srt"})
+                    seen.add(sub)
+
+
+        # --- Series ---
+        elif row.get("program_type", "").lower() == "show":
+            series = row.get("movie_show_title", "")
+            year = row.get("production_year", "")
+            ep_title = row.get("episode_name", "")
+            season = int(row.get("season_number", 0))
+            episode = int(row.get("episode_number", 0))
+
+            series_base = normalize_title(f"{series}.({year})")
+            ep_base = (
+                f"{series_base}.s{season:02d}e{episode:02d}."
+                f"{normalize_title(ep_title)}"
+            )
+
+            # Film
+            original = row.get("episode_filename", "")
+            if original and original not in seen:
+                mappings.append({"original": original, "new": f"{ep_base}.mp4"})
+                seen.add(original)
+
+            # Trailer
+            trailer = row.get("trailer_filename", "")
+            if trailer and trailer not in seen:
+                mappings.append({"original": trailer, "new": f"{series_base}-trailer.mp4"})
+                seen.add(trailer)
+
+            # Episode Posters
+            for key, suffix in [
+                ("key_art_16_9_filename", "-poster.(16x9).jpg"),
+                ("key_art_2_3_filename", "-poster.(2x3).jpg"),
+                ("key_art_3_4_filename", "-poster.(3x4).jpg"),
+            ]:
+                original = row.get(key, "")
+                if original and original not in seen:
+                    mappings.append({"original": original, "new": f"{ep_base}{suffix}"})
+                    seen.add(original)
+
+            # Subtitles
+            subs = row.get("episode_subtitles_captions_filenames", "")
+            for sub in [s.strip() for s in subs.split(",") if s.strip()]:
+                if sub not in seen:
+                    lang = extract_language(sub)
+                    if lang not in lang_seen:
+                        mappings.append({"original": sub, "new": f"{ep_base}.{lang}.srt"})
+                        seen.add(sub)
+                        lang_seen.add(lang)
+
+
+    return mappings
+
+def build_mappings(self, row: dict) -> list:
+    mappings = []
+    program_type = row.get("program_type", "").lower()
+    title = normalize_title(row.get("movie_show_title", ""))
+    year = str(row.get("production_year", "")).strip()
+    self.queue.put(("log", f" program_type {program_type}"))
+    if program_type == "movie":
+        base = f"{title}.({year})" if year else title
+
+        # 🎬 Film
+        if row.get("movie_filename"):
+            mappings.append({
+                "original": row["movie_filename"],
+                "new": f"{base}.mp4"
+            })
+
+        # 🎞 Trailer
+        if row.get("trailer_filename"):
+            mappings.append({
+                "original": row["trailer_filename"],
+                "new": f"{base}-trailer.mp4"
+            })
+
+        # 📝 Subtitles (multiple)
+        subs = row.get("movie_subtitles_captions_filenames", "")
+        seen = set()
+        for sub in [s.strip() for s in subs.split(",") if s.strip()]:
+            if sub not in seen:
+                seen.add(sub)
+                lang = extract_language(sub)
+                mappings.append({"original": sub, "new": f"{base}.{lang}.srt"})
+
+        # 🖼 Posters
+        for key, suffix in {
+            "key_art_16_9_filename": "poster.(16x9).jpg",
+            "key_art_2_3_filename": "poster.(2x3).jpg",
+            "key_art_3_4_filename": "poster.(3x4).jpg"
+        }.items():
+            if row.get(key):
+                mappings.append({
+                    "original": row[key],
+                    "new": f"{base}-{suffix}"
+                })
+
+    elif program_type == "show":
+        season = int(row.get("season_number", 1))
+        episode = int(row.get("episode_number", 1))
+        ep_title = normalize_title(row.get("episode_name", ""))
+
+        series_base = f"{title}.({year})" if year else title
+        s_str, e_str = f"s{season:02d}", f"e{episode:02d}"
+        ep_base = f"{series_base}.{s_str}{e_str}.{ep_title}"
+
+        # 🎬 Episode file
+        if row.get("film_filename"):
+            mappings.append({
+                "original": row["film_filename"],
+                "new": f"{ep_base}.mp4"
+            })
+
+        # 🎞 Trailer
+        if row.get("trailer_filename"):
+            mappings.append({
+                "original": row["trailer_filename"],
+                "new": f"{ep_base}-trailer.mp4"
+            })
+
+        # 📝 Subtitles (multiple)
+        subs = row.get("episode_subtitles_captions_filenames", "")
+        for sub in [s.strip() for s in subs.split(",") if s.strip()]:
+            lang = extract_language(sub)
+            mappings.append({"original": sub, "new": f"{ep_base}.{lang}.srt"})
+
+        # 🖼 Posters
+        for key, suffix in {
+            "key_art_16_9_filename": "poster.(16x9).jpg",
+            "key_art_2_3_filename": "poster.(2x3).jpg",
+            "key_art_3_4_filename": "poster.(3x4).jpg"
+        }.items():
+            if row.get(key):
+                mappings.append({
+                    "original": row[key],
+                    "new": f"{ep_base}-{suffix}"
+                })
+
+    return mappings
+
+def find_mapping(mappings: list, original_filename: str) -> dict | None:
+    """
+    Find a mapping entry by its original filename.
+    Returns the mapping dict or None if not found.
+    """
+    for m in mappings:
+        if m["original"] == original_filename:
+            return m
+    return None
+
+
+# ---------- GUI App ----------
+class S3SyncApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("PNM FilmHub S3 Sync App")
+        self.geometry("1100x600")
+
+        self.cfg = load_config()
+        self.s3_client = None
+
+        self.queue = queue.Queue()
+        self.stop_flags = {}
+        self.worker_thread = None
+        self.stop_event = threading.Event()
+        self.poll_queue()
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        # Notebook with two tabs
+        nb = ttk.Notebook(self)
+        nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        # Listing/Sync tab
+        self.listing_frame = ttk.Frame(nb)
+        nb.add(self.listing_frame, text="Listing / Sync")
+
+        self.build_listing(self.listing_frame)
+
+        # Settings tab
+        self.settings_frame = ttk.Frame(nb)
+        nb.add(self.settings_frame, text="Settings")
+
+        self.build_settings(self.settings_frame)
+
+        if not self.cfg or not self.cfg.get("bucket_name"):  
+            # config missing → open Settings
+            nb.select(self.settings_frame)
+        else:
+            # config ok → open Listing
+            nb.select(self.listing_frame)
+       
+    # ---- Settings UI ----
+    def build_settings(self, parent):
+        pad = 6
+        frm = ttk.Frame(parent)
+        frm.pack(fill=tk.X, padx=12, pady=12)
+
+        # Target path
+        ttk.Label(frm, text="Target Path (local):").grid(row=0, column=0, sticky=tk.W, pady=pad)
+        self.target_path_var = tk.StringVar(value=self.cfg.get("target_path", ""))
+        self.target_entry = ttk.Entry(frm, textvariable=self.target_path_var, width=60)
+        self.target_entry.grid(row=0, column=1, sticky=tk.W, padx=(4,4))
+        ttk.Button(frm, text="Browse…", command=self.browse_target).grid(row=0, column=2, sticky=tk.W)
+
+        # AWS Access Key
+        ttk.Label(frm, text="AWS Access Key ID:").grid(row=1, column=0, sticky=tk.W, pady=pad)
+        self.aws_access_var = tk.StringVar(value=self.cfg.get("aws_access_key_id", ""))
+        ttk.Entry(frm, textvariable=self.aws_access_var, width=60).grid(row=1, column=1, columnspan=2, sticky=tk.W)
+
+        # AWS Secret Key
+        ttk.Label(frm, text="AWS Secret Access Key:").grid(row=2, column=0, sticky=tk.W, pady=pad)
+        self.aws_secret_var = tk.StringVar(value=self.cfg.get("aws_secret_access_key", ""))
+        ttk.Entry(frm, textvariable=self.aws_secret_var, width=60, show="*").grid(row=2, column=1, columnspan=2, sticky=tk.W)
+
+        # Region
+        ttk.Label(frm, text="Default region name:").grid(row=3, column=0, sticky=tk.W, pady=pad)
+        self.region_var = tk.StringVar(value=self.cfg.get("region_name", ""))
+        ttk.Entry(frm, textvariable=self.region_var, width=60).grid(row=3, column=1, columnspan=2, sticky=tk.W)
+
+        # Region
+        ttk.Label(frm, text="Endpoint Url:").grid(row=4, column=0, sticky=tk.W, pady=pad)
+        self.endpoint_var = tk.StringVar(value=self.cfg.get("endpoint_url", ""))
+        ttk.Entry(frm, textvariable=self.endpoint_var, width=60).grid(row=4, column=1, columnspan=2, sticky=tk.W)
+
+        # Bucket name
+        ttk.Label(frm, text="Bucket name:").grid(row=5, column=0, sticky=tk.W, pady=pad)
+        self.bucket_var = tk.StringVar(value=self.cfg.get("bucket_name", ""))
+        ttk.Entry(frm, textvariable=self.bucket_var, width=60).grid(row=5, column=1, columnspan=2, sticky=tk.W)
+
+        # Save / Test buttons
+        btn_frame = ttk.Frame(frm)
+        btn_frame.grid(row=6, column=0, columnspan=3, pady=(12,0))
+        ttk.Button(btn_frame, text="Save", command=self.save_settings).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="Test & List Prefixes", command=self.test_list_prefixes).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btn_frame, text="Reload config", command=self.reload_config).pack(side=tk.LEFT, padx=8)
+
+        # small note
+        ttk.Label(parent, text="Config saved to: " + get_config_path(), font=("Segoe UI", 8)).pack(anchor=tk.W, padx=12, pady=(6,0))
+
+    def browse_target(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.target_path_var.set(d)
+
+    def save_settings(self):
+        self.cfg["target_path"] = self.target_path_var.get().strip()
+        self.cfg["aws_access_key_id"] = self.aws_access_var.get().strip()
+        self.cfg["aws_secret_access_key"] = self.aws_secret_var.get().strip()
+        self.cfg["region_name"] = self.region_var.get().strip()
+        self.cfg["endpoint_url"] = self.endpoint_var.get().strip()
+        self.cfg["bucket_name"] = self.bucket_var.get().strip()
+
+        ok = save_config(self.cfg)
+        if ok:
+            messagebox.showinfo("Saved", "Configuration saved.")
+            # update s3 client
+            self.s3_client = None
+        else:
+            messagebox.showerror("Error", "Failed to save configuration.")
+
+    def reload_config(self):
+        self.cfg = load_config()
+        self.target_path_var.set(self.cfg.get("target_path", ""))
+        self.aws_access_var.set(self.cfg.get("aws_access_key_id", ""))
+        self.region_var.set(self.cfg.get("region_name", ""))
+        self.aws_secret_var.set(self.cfg.get("aws_secret_access_key", ""))
+        self.endpoint_var.set(self.cfg.get("endpoint_url", ""))
+        self.bucket_var.set(self.cfg.get("bucket_name", ""))
+        messagebox.showinfo("Reloaded", "Configuration reloaded.")
+
+    def test_list_prefixes(self):
+        # quick test to see if credentials and bucket are OK
+        cfg = {
+            "aws_access_key_id": self.aws_access_var.get().strip(),
+            "aws_secret_access_key": self.aws_secret_var.get().strip(),
+            "region_name": self.region_var.get().strip(),
+            "endpoint_url": self.endpoint_var.get().strip()
+        }
+        bucket = self.bucket_var.get().strip()
+        if not bucket:
+            messagebox.showerror("Error", "Enter bucket name first.")
+            return
+
+        # Run network call in background thread to avoid blocking UI
+        def _worker():
+            try:
+                client = make_s3_client(cfg)
+                prefixes = list_top_level_prefixes(client, bucket)
+                self.after(0, lambda: messagebox.showinfo("Prefixes", f"Found {len(prefixes)} top-level prefixes.\nExample: {prefixes[:5]}"))
+            except NoCredentialsError:
+                self.after(0, lambda: messagebox.showerror("Credentials Error", "Invalid or missing AWS credentials."))
+            except ClientError as e:
+                self.after(0, lambda: messagebox.showerror("S3 Error", f"S3 error: {e}"))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Error", f"Error: {e}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ---- Listing / Sync UI ----
+    def build_listing(self, parent):
+        topframe = ttk.Frame(parent)
+        topframe.pack(fill=tk.X, padx=8, pady=8)
+
+        self.progress = ttk.Progressbar(topframe, mode="indeterminate")
+        self.progress.pack(fill="x", padx=10, pady=10)
+
+        row_frame = ttk.Frame(topframe)
+        row_frame.pack(side=tk.TOP, anchor="nw", padx=10, pady=5)
+
+        ttk.Label(row_frame, text="Bucket:").pack(side=tk.LEFT)
+        self.bucket_label_var = tk.StringVar(value=self.cfg.get("bucket_name", ""))
+        ttk.Label(row_frame, textvariable=self.bucket_label_var, font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT, padx=(6,20))
+
+        ttk.Label(row_frame, text="Status:").pack(side=tk.LEFT)
+        self.status = ttk.Label(row_frame, text="", font=("Segoe UI", 14, "bold"))
+        self.status.pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Button(topframe, text="Refresh List", command=self.refresh_prefix_list).pack(side=tk.LEFT)
+        ttk.Button(topframe, text="Start Sync All", command=lambda: self.start_sync(selected_only=False)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(topframe, text="Stop Sync All", command=lambda: self.stop_sync(selected_only=False)).pack(side=tk.LEFT)
+        ttk.Button(topframe, text="Start Sync Selected", command=lambda: self.start_sync(selected_only=True)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(topframe, text="Stop Sync Selected", command=lambda: self.stop_sync(selected_only=True)).pack(side=tk.LEFT)
+
+        try:
+            tk.Label(topframe, text="Filter by status:").pack(side="left", padx=5)
+
+            self.status_filter = tk.StringVar(value="all")
+            status_options = ["all", "pending", "downloading", "completed", "error"]
+
+            ttk.OptionMenu(topframe, self.status_filter, "all", *status_options,
+                        command=lambda _: self.filter_by_status(self.status_filter.get())
+            ).pack(side="left", padx=5)
+        except Exception as e:
+            self.queue.put(("log", f"error during filter: {e}"))
+
+        # Treeview
+        cols = ("s3_folder", "local_folder", "progress", "action")
+        self.tree = ttk.Treeview(parent, columns=cols, show="headings", height=15)
+        self.tree.heading("s3_folder", text="S3 Folder (prefix)")
+        self.tree.heading("local_folder", text="Local Folder Name")
+        self.tree.heading("progress", text="Progress (downloaded/total)")
+        self.tree.heading("action", text="Action")
+        self.tree.column("s3_folder", width=360, anchor=tk.W)
+        self.tree.column("local_folder", width=240, anchor=tk.W)
+        self.tree.column("progress", width=160, anchor=tk.CENTER)
+        self.tree.column("action", width=160, anchor=tk.CENTER)
+        self.tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0,8))
+
+        style = ttk.Style()
+        style.configure("Pending.Treeview", background="#808080", foreground="#FFFFFF")  
+        style.configure("Downloading.Treeview", background="#E89149", foreground="#FFFFFF")  
+        style.configure("Stopped.Treeview", background="#FF474C", foreground="#FFFFFF")  
+        style.configure("Completed.Treeview", background="#90EE90", foreground="#000000")    
+
+        self.tree.tag_configure("pending", background="#808080", foreground="#FFFFFF") 
+        self.tree.tag_configure("downloading", background="#E89149", foreground="#FFFFFF") 
+        self.tree.tag_configure("stopped", background="#FF474C", foreground="#FFFFFF") 
+        self.tree.tag_configure("completed", background="#90EE90", foreground="#000000")  
+
+        # allow selecting multiple
+        self.tree.configure(selectmode="extended")
+
+        # double click on local_folder to edit
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
+        # self.tree.bind("<Double-1>", self.on_tree_double_click)
+
+        # mapping dict for progress and local folder names
+        self.prefix_rows = {}  # prefix -> {"item": tree_item_id, "local_name": str, "downloaded": int, "total": int}
+
+        # small logfile/scrolledtext
+        ttk.Label(parent, text="Log:").pack(anchor=tk.W, padx=8)
+        self.logbox = scrolledtext.ScrolledText(parent, height=15, state=tk.DISABLED)
+        self.logbox.pack(fill=tk.BOTH, expand=False, padx=8, pady=(0,8))
+
+    def log(self, s):
+        timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ")
+        self.logbox.configure(state=tk.NORMAL)
+        self.logbox.insert(tk.END, timestamp + s + "\n")
+        self.logbox.see(tk.END)
+        self.logbox.configure(state=tk.DISABLED)
+
+    def on_tree_double_click(self, event):
+        # Determine which column clicked. Allow editing "local_folder"
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        col = self.tree.identify_column(event.x)
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        col_num = int(col.replace("#",""))
+        if col_num != 2 and col_num != 4 :
+            # only allow edits for column 2 (local_folder)
+            return
+        if col_num == 2:
+            prefix = self.tree.item(row, "values")[0]
+            current_local = self.prefix_rows.get(prefix, {}).get("local_name", "")
+            new_local = simpledialog.askstring("Edit Local Folder Name", f"Local folder name for S3 prefix:\n{prefix}", initialvalue=current_local)
+            if new_local is not None:
+                self.prefix_rows[prefix]["local_name"] = new_local.strip()
+                self.tree.set(row, "local_folder", new_local.strip())
+        elif col_num == 4:
+            prefix = self.tree.item(row, "values")[0]
+            local_name = self.prefix_rows.get(prefix, {}).get("local_name", "")
+            target_path = self.cfg.get("target_path", "")
+            if not target_path:
+                messagebox.showerror("Error", "Set target path in Settings first.")
+                return
+            full_path = os.path.join(target_path, local_name)
+            self.open_folder(full_path)
+
+    def open_folder(self, path):
+        if not os.path.exists(path):
+            messagebox.showerror("Error", f"Folder does not exist:\n{path}")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)
+            elif sys.platform.startswith("darwin"):
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open folder:\n{e}")
+
+    def refresh_prefix_list(self):
+        """Entry point called from button/menu → runs worker thread."""
+        # Clear tree immediately (UI safe)
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        self.prefix_rows.clear()
+
+        # Capture config safely
+        self.cfg.update({
+            "bucket_name": self.bucket_var.get().strip(),
+            "aws_access_key_id": self.aws_access_var.get().strip(),
+            "aws_secret_access_key": self.aws_secret_var.get().strip(),
+            "region_name": self.region_var.get().strip(),
+            "endpoint_url": self.endpoint_var.get().strip(),
+            "target_path": self.target_path_var.get().strip()
+        })
+        self.bucket_label_var.set(self.cfg.get("bucket_name", ""))
+
+        if not self.cfg.get("bucket_name"):
+            messagebox.showerror("Error", "Set bucket name in Settings first.")
+            return
+
+        # Launch worker thread
+        thread = threading.Thread(target=self._refresh_prefix_list_worker, daemon=True)
+        thread.start()
+
+    def _refresh_prefix_list_worker(self):
+        """Worker thread → only S3 calls & data collection here."""
+        try:
+
+            self.status.config(text="Processing...")
+            self.progress.config(mode="indeterminate")
+            self.progress.start(10)   
+            s3_client = make_s3_client(self.cfg)
+            prefixes = list_top_level_prefixes(s3_client, self.cfg["bucket_name"])
+
+            result = []
+            for pref in prefixes:
+                try:
+                    default_local = pref.rstrip("/").split("/")[-1] or pref.rstrip("/")
+                    keys = list_objects_for_prefix(s3_client, self.cfg["bucket_name"], pref)
+                    total = len(keys)
+
+                    # Check for CSV and parse it here (background thread) to avoid blocking UI
+                    csv_key = get_csv_for_prefix(s3_client, self.cfg["bucket_name"], pref)
+                    csv_parsed = False
+                    csv_parse_data = []
+                    mappings = []
+                    local_name = default_local
+
+                    if csv_key:
+                        try:
+                            csv_parse_data = self.parse_csv_from_s3(self.cfg["bucket_name"], s3_client, csv_key)
+                            if csv_parse_data:
+                                csv_first_row = csv_parse_data[0]
+                                mappings = build_mappings_list(self, csv_parse_data)
+                                if mappings:
+                                    total = len(mappings)
+                                # derive local_name from csv first row (if present)
+                                local_name = normalize_title(csv_first_row.get("movie_show_title", default_local)) + ".(" + normalize_title(str(csv_first_row.get("production_year", ""))) + ")"
+                                csv_parsed = True
+                        except Exception as e:
+                            # log parse error but continue
+                            tb = traceback.format_exc()
+                            self.queue.put(("log", f"[{pref}] CSV parse error: {e}\n{tb}"))
+
+                    result.append({
+                        "prefix": pref,
+                        "default_local": local_name,
+                        "total": total,
+                        "csv_parsed": csv_parsed,
+                        "filter_file_mappings": mappings
+                    })
+
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    self.queue.put(("log", f"[{pref}] error collecting info: {e}\n{tb}"))
+
+            # Push result back to main thread
+            self.tree.after(0, lambda: self._refresh_prefix_list_done(result))
+
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.log("Error listing prefixes: " + str(e))
+            self.tree.after(0, lambda: messagebox.showerror("Error", f"Failed to list prefixes:\n{e}"))
+
+    def _refresh_prefix_list_done(self, result):
+        """Runs in main thread → safe to update UI."""
+        if not result:
+            self.log("No top-level prefixes found (bucket might have objects at root or be empty).")
+            return
+
+        for row in result:
+            local_name = row.get("default_local", "")
+            total = row.get("total", 0)
+            mappings = row.get("filter_file_mappings", [])
+            csv_parsed = row.get("csv_parsed", False)
+
+            item = self.tree.insert(
+                "",
+                tk.END,
+                values=(row["prefix"], local_name, f"0/{total}", "Open Folder")
+            )
+            self.prefix_rows[row["prefix"]] = {
+                "item": item,
+                "local_name": local_name,
+                "downloaded": 0,
+                "csv_parsed": csv_parsed,
+                "filter_file_mappings": mappings,
+                "total": total,
+                "status": "pending"
+            }
+
+        self.log(f"Refreshed list: {len(result)} prefixes.")
+        self.progress.stop()
+        self.progress.config(mode="determinate", maximum=100, value=100)
+        self.status.config(text="Done!")
+
+    # ---- Sync logic ----
+    def filter_by_status(self, status: str):
+        """Filter Treeview rows by status ('all', 'pending', 'downloading', 'completed', 'error')."""
+        
+        # Clear all current rows in Treeview
+        # for iid in self.tree.get_children():
+        #     self.tree.delete(iid)
+
+        # # Re-insert only the rows that match the filter
+        # for pref, row in self.prefix_rows.items():
+        #     if status == "all" or row["status"] == status:
+        #         values = (pref, row["local_name"], f"{row['downloaded']}/{row['total']}")
+        #         item = self.tree.insert("", "end", values=values)
+                
+        #         # keep reference to the new item ID
+        #         self.prefix_rows[pref]["item"] = item
+
+
+    def start_sync(self, selected_only=True):
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("Worker running", "Sync already running.")
+            return
+        cfg = {
+            "aws_access_key_id": self.aws_access_var.get().strip(),
+            "aws_secret_access_key": self.aws_secret_var.get().strip(),
+            "region_name": self.region_var.get().strip(),
+            "endpoint_url": self.endpoint_var.get().strip()
+        }
+        bucket = self.bucket_var.get().strip()
+        target_path = self.target_path_var.get().strip()
+        if not bucket or not target_path:
+            messagebox.showerror("Error", "Please set bucket name and target path in Settings.")
+            return
+        # Build list of prefixes to sync
+        if selected_only:
+            selected = self.tree.selection()
+            if not selected:
+                messagebox.showwarning("No selection", "Select tree rows or use 'Start Sync All'.")
+                return
+            prefixes = [ self.tree.item(iid, "values")[0] for iid in selected ]
+        else:
+            prefixes = list(self.prefix_rows.keys())
+
+        # compute totals before starting: count objects per prefix
+        try:
+            self.s3_client = make_s3_client(self.cfg)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create S3 client: {e}")
+            return
+
+        # Reset counters
+        for p in prefixes:
+            self.prefix_rows[p]["downloaded"] = 0
+            # self.prefix_rows[p]["total"] = 0
+            self.prefix_rows[p]["status"] = "pending"
+            self.update_tree_progress(p)
+            self.stop_flags[p] = False
+
+
+        # start worker thread
+        self.stop_event.clear()
+        self.stop_flags = {}
+        self.worker_thread = threading.Thread(target=self.worker_sync, args=(self.s3_client, bucket, target_path, prefixes), daemon=True)
+        self.worker_thread.start()
+        self.log("Sync started.")
+
+    def stop_sync(self, selected_only=True):
+        if self.worker_thread and self.worker_thread.is_alive():
+            
+            if selected_only:
+                selected = self.tree.selection()
+                if not selected:
+                    messagebox.showwarning("No selection", "Select tree rows or use 'Start Sync All'.")
+                    return
+                prefixes = [ self.tree.item(iid, "values")[0] for iid in selected ]
+            else:
+                prefixes = list(self.prefix_rows.keys())
+
+            for p in prefixes:
+                self.stop_flags[p] = True
+                self.log(f"Sync stopped for {p}")
+
+            self.stop_event.set()
+            self.log("Sync stopped.")
+
+    def worker_sync(self, s3_client, bucket, target_path, prefixes):
+        """
+        Worker thread:
+          - counts files per prefix
+          - downloads each file, updates queue with progress events
+        """
+        try:
+            self.status.config(text="Processing...")
+            self.progress.config(mode="indeterminate")
+            self.progress.start(10)   
+            # First compute total counts
+            # for pref in prefixes:
+            #     if self.stop_event.is_set():
+            #         if self.stop_flags.get(pref, False):
+            #             self.log(f"Stopped sync for {pref}")
+            #             self.queue.put(("status", pref, "stopped"))
+            #             continue
+            #     try:
+            #         keys = list_objects_for_prefix(s3_client, bucket, pref)
+            #         total = len(keys)
+            #         self.prefix_rows[pref]["total"] = total
+            #         # push initial update
+            #         self.queue.put(("set_total", pref, total))
+            #         self.queue.put(("status", pref, "pending"))
+            #         self.log(f"[{pref}] total files: {total}")
+            #     except Exception as e:
+            #         self.queue.put(("log", f"[{pref}] worker_sync error counting objects: {e}"))
+            #         self.queue.put(("set_total", pref, 0))
+            # Now download per prefix
+            for pref in prefixes:
+                if self.stop_event.is_set():
+                    if self.stop_flags.get(pref, False):
+                        self.log(f"Stopped sync for {pref}")
+                        self.queue.put(("status", pref, "stopped"))
+                        continue
+                total = self.prefix_rows[pref]["total"]
+                if total == 0:
+                    self.queue.put(("log", f"[{pref}] no files to download. {self.prefix_rows[pref]}"))
+                    continue
+                keys = list_objects_for_prefix(s3_client, bucket, pref)
+                self.queue.put(("status", pref, "downloading"))
+                filter_file_mappings = self.prefix_rows[pref]["filter_file_mappings"]
+                for key in keys:
+                    if self.stop_event.is_set():
+                        if self.stop_flags.get(pref, False):
+                            self.log(f"Stopped sync for {pref}")
+                            self.queue.put(("status", pref, "stopped"))
+                            continue
+                    
+                    # s3_size = get_s3_file_size(self, s3_client, bucket, key)
+
+                    # Skip "folders" (keys ending with '/')
+                    if key.endswith("/"):
+                        continue
+                    
+                    if key.endswith(".mp4"):
+                        continue
+
+                    # 🚨 Skip hidden files/folders (start with a dot after the prefix)
+                    relative_path = os.path.relpath(key, pref)
+                    if relative_path.startswith("."):
+                        continue
+
+                    # Determine relative path under prefix
+                    # If prefix is "foo/", and key is "foo/a/b.txt", relative = "a/b.txt"
+                    rel = key[len(pref):] if key.startswith(pref) else key
+                    
+                    mapping_key_data = find_mapping(filter_file_mappings, rel)
+                    if mapping_key_data:
+                        # local folder name mapping:
+                        local_name = self.prefix_rows[pref]["local_name"]
+                        local_folder = os.path.join(target_path, local_name)
+                        local_full_path = os.path.join(local_folder, mapping_key_data["new"].replace("/", os.sep))
+                        local_dir = os.path.dirname(local_full_path)
+                        os.makedirs(local_dir, exist_ok=True)
+                        try:
+                            self.queue.put(("log", f"Download Start for: {local_full_path}"))
+                            s3_client.download_file(bucket, key, local_full_path)
+                        except Exception as e:
+                            # log error but continue
+                            self.queue.put(("log", f"[{pref}] failed to download {key}: {e}"))
+                            continue
+                        # increment downloaded
+                        self.prefix_rows[pref]["downloaded"] += 1
+                        downloaded = self.prefix_rows[pref]["downloaded"]
+                        self.queue.put(("progress", pref, downloaded))
+                self.queue.put(("log", f"[{pref}] Completed."))
+                self.queue.put(("status", pref, "completed"))
+
+
+            self.queue.put(("log", "All sync tasks completed."))
+            self.progress.stop()
+            self.progress.config(mode="determinate", maximum=100, value=100)
+            self.status.config(text="Done!")
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.queue.put(("log", f"Worker error: {e}\n{tb}"))
+        finally:
+            self.queue.put(("done",))
+
+    # def parse_csv(self, file_path):
+    #     """
+    #     Parse CSV into a list of dicts.
+    #     Column headers are normalized: spaces & special characters -> '_'
+    #     """
+    #     rows = []
+    #     with open(file_path, newline='', encoding="utf-8") as csvfile:
+    #         reader = csv.DictReader(csvfile)
+
+    #         # Normalize headers
+    #         reader.fieldnames = [
+    #             re.sub(r'[^0-9a-zA-Z]+', '_', field.strip()).lower()
+    #             for field in reader.fieldnames
+    #         ]
+
+    #         for row in reader:
+    #             # Normalize keys in each row too
+    #             cleaned_row = {
+    #                 re.sub(r'[^0-9a-zA-Z]+', '_', k.strip()).lower(): v.strip()
+    #                 for k, v in row.items()
+    #             }
+    #             rows.append(cleaned_row)
+    #             self.queue.put(("log", "status : "+cleaned_row))
+
+    #     return rows
+
+    def parse_csv_from_s3(self, bucket_name, s3client, key, first_only: bool=False):
+
+        try:
+            obj = s3client.get_object(Bucket=bucket_name, Key=key)
+            df = pd.read_csv(obj["Body"], dtype=str, keep_default_na=False, index_col=False) # Reads directly from S3 response body
+
+            if df.empty:
+                return [] if not first_only else None
+
+             # Normalize headers
+            df.columns = normalize_cols(df.columns, '_')
+            # Trim spaces
+            # df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+            df = df.apply(lambda col: col.map(lambda x: x.strip() if isinstance(x, str) else x))
+
+            records = []
+            for _, row in df.iterrows():
+                rec = row.to_dict()
+
+                # ✅ Always force first column value as template_description
+                first_col = df.columns[0]
+                records.append(rec)
+
+            return (records[0] if (first_only and records) else records)
+
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.queue.put(("log", f"parse_csv_from_s3 error : {e}\n{tb}"))
+            return [] if not first_only else None
+
+    def parse_csv(self, file_path):
+        data = []
+        with open(file_path, newline='', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            # Sanitize headers: replace spaces/special chars with underscores
+            reader.fieldnames = [re.sub(r'\W+', '_', h.strip()) for h in reader.fieldnames]
+
+            for row in reader:
+                clean_row = {}
+                for k, v in row.items():
+
+                    if isinstance(k, str):
+                        clean_key = re.sub(r"[^0-9a-zA-Z]+", "_", k.strip().lower())
+                    else:
+                        clean_key = str(k).lower()
+
+                    # Normalize value
+                    if v is None:
+                        v = ""
+                    elif isinstance(v, list):  
+                        v = ",".join(map(str, v))  # flatten list into CSV-safe string
+                    else:
+                        v = str(v)  # force everything into string
+                    
+                    clean_row[clean_key] = v.strip()
+                self.queue.put(("log", f"Status : ${json.dumps(clean_row)}"))
+                data.append(clean_row)
+        return data
+
+    def update_tree_progress(self, prefix):
+        info = self.prefix_rows.get(prefix)
+        if not info:
+            return
+        item = info["item"]
+        downloaded = info.get("downloaded", 0)
+        total = info.get("total", 0)
+        self.tree.set(item, "progress", f"{downloaded}/{total}")
+        self.tree.set(item, "local_folder", info.get("local_name", ""))
+
+    def update_tree_status(self, prefix, status):
+        info = self.prefix_rows.get(prefix)
+        if not info:
+            return
+        item = info["item"]
+        status = info.get("status", "")
+        # self.queue.put(("log", "status : "+status))
+        self.tree.item(item, tags=(status,))
+
+    def poll_queue(self):
+        try:
+            while True:
+                msg = self.queue.get_nowait()
+                if not msg:
+                    continue
+                tag = msg[0]
+                if tag == "progress":
+                    _, prefix, downloaded = msg
+                    self.prefix_rows[prefix]["downloaded"] = downloaded
+                    self.update_tree_progress(prefix)
+                elif tag == "set_total":
+                    _, prefix, total = msg
+                    self.prefix_rows[prefix]["total"] = total
+                    self.update_tree_progress(prefix)
+                elif tag == "status":
+                    _, prefix, status = msg
+                    self.prefix_rows[prefix]["status"] = status
+                    self.update_tree_status(prefix, status)
+                elif tag == "log":
+                    _, s = msg
+                    self.log(s)
+                elif tag == "done":
+                    self.log("Worker finished.")
+                else:
+                    self.log(str(msg))
+        except queue.Empty:
+            pass
+        # poll again after 100ms
+        self.after(100, self.poll_queue)
+
+# ---------- Main ----------
+def main():
+    try:
+
+        # ensure running on Windows (app is intended Windows-only)
+        # but allow running elsewhere for testing:
+        if not sys.platform.startswith("win"):
+            # show a warning but continue
+            print("Warning: this app is intended for Windows desktop. Running on non-Windows platform for testing.")
+
+        app = S3SyncApp()
+        app.mainloop()
+    except Exception as e:
+        with open("error.log", "a") as f:
+            f.write(traceback.format_exc())
+
+if __name__ == "__main__":
+    main()
