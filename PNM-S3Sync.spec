@@ -1,0 +1,64 @@
+# -*- mode: python ; coding: utf-8 -*-
+
+
+a = Analysis(
+    ['PNM-S3Sync.py'],
+    pathex=[],
+    binaries=[],
+    datas=[],
+    hiddenimports=[ 
+        'pandas',
+        'pandas._libs.tslibs.np_datetime',
+        'pandas._libs.tslibs.nattype',
+        'pandas._libs.skiplist',
+        'pandas._libs.tslibs.timestamps',
+        'pandas._libs.tslibs.fields',
+        'pandas._libs.tslibs.timedeltas',
+        'pandas._libs.tslibs.base',
+        'boto3',
+        'botocore',
+        'botocore.configloader',
+        'botocore.credentials',
+        'botocore.session',
+        'botocore.client',
+        'botocore.endpoint',
+        'botocore.parsers',
+        'botocore.retryhandler',
+        'botocore.handlers',
+        'botocore.exceptions',
+        ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name='PNM-S3Sync',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+app = BUNDLE(
+    exe,
+    name='PNM-S3Sync.app',
+    icon=None,
+    bundle_identifier=None,
+)
