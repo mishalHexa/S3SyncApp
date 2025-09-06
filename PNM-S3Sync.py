@@ -405,7 +405,6 @@ def get_result_object_filmhub(self, pref, s3_client) -> dict:
     default_local = pref.rstrip("/").split("/")[-1] or pref.rstrip("/")
     keys = list_objects_for_prefix(self, s3_client, self.cfg["bucket_name"], pref)
     total = len(keys)
-    print("default_local ",default_local)
     csv_key = get_csv_for_prefix(s3_client, self.cfg["bucket_name"], pref)
     data_parsed = False
     csv_parse_data = []
@@ -460,92 +459,6 @@ def get_result_object_normal(self, pref, s3_client) -> dict:
         "filter_file_mappings": mappings
     }
     return result
-# def build_mappings(self, row: dict) -> list:
-#     mappings = []
-#     program_type = row.get("program_type", "").lower()
-#     title = normalize_title(row.get("movie_show_title", ""))
-#     year = str(row.get("production_year", "")).strip()
-#     self.queue.put(("log", f" program_type {program_type}"))
-#     if program_type == "movie":
-#         base = f"{title}.({year})" if year else title
-
-#         # 🎬 Film
-#         if row.get("movie_filename"):
-#             mappings.append({
-#                 "original": row["movie_filename"],
-#                 "new": f"{base}.mp4"
-#             })
-
-#         # 🎞 Trailer
-#         if row.get("trailer_filename"):
-#             mappings.append({
-#                 "original": row["trailer_filename"],
-#                 "new": f"{base}-trailer.mp4"
-#             })
-
-#         # 📝 Subtitles (multiple)
-#         subs = row.get("movie_subtitles_captions_filenames", "")
-#         seen = set()
-#         for sub in [s.strip() for s in subs.split(",") if s.strip()]:
-#             if sub not in seen:
-#                 seen.add(sub)
-#                 lang = extract_language(sub)
-#                 mappings.append({"original": sub, "new": f"{base}.{lang}.srt"})
-
-#         # 🖼 Posters
-#         for key, suffix in {
-#             "key_art_16_9_filename": "poster.(16x9).jpg",
-#             "key_art_2_3_filename": "poster.(2x3).jpg",
-#             "key_art_3_4_filename": "poster.(3x4).jpg"
-#         }.items():
-#             if row.get(key):
-#                 mappings.append({
-#                     "original": row[key],
-#                     "new": f"{base}-{suffix}"
-#                 })
-
-#     elif program_type == "show":
-#         season = int(row.get("season_number", 1))
-#         episode = int(row.get("episode_number", 1))
-#         ep_title = normalize_title(row.get("episode_name", ""))
-
-#         series_base = f"{title}.({year})" if year else title
-#         s_str, e_str = f"s{season:02d}", f"e{episode:02d}"
-#         ep_base = f"{series_base}.{s_str}{e_str}.{ep_title}"
-
-#         # 🎬 Episode file
-#         if row.get("film_filename"):
-#             mappings.append({
-#                 "original": row["film_filename"],
-#                 "new": f"{ep_base}.mp4"
-#             })
-
-#         # 🎞 Trailer
-#         if row.get("trailer_filename"):
-#             mappings.append({
-#                 "original": row["trailer_filename"],
-#                 "new": f"{ep_base}-trailer.mp4"
-#             })
-
-#         # 📝 Subtitles (multiple)
-#         subs = row.get("episode_subtitles_captions_filenames", "")
-#         for sub in [s.strip() for s in subs.split(",") if s.strip()]:
-#             lang = extract_language(sub)
-#             mappings.append({"original": sub, "new": f"{ep_base}.{lang}.srt"})
-
-#         # 🖼 Posters
-#         for key, suffix in {
-#             "key_art_16_9_filename": "poster.(16x9).jpg",
-#             "key_art_2_3_filename": "poster.(2x3).jpg",
-#             "key_art_3_4_filename": "poster.(3x4).jpg"
-#         }.items():
-#             if row.get(key):
-#                 mappings.append({
-#                     "original": row[key],
-#                     "new": f"{ep_base}-{suffix}"
-#                 })
-
-#     return mappings
 
 def find_mapping(mappings: list, original_filename: str) -> dict | None:
     """
@@ -791,18 +704,6 @@ class S3SyncApp(tk.Tk):
         ttk.Button(topframe, text="Start Sync Selected", command=lambda: self.start_sync(selected_only=True)).pack(side=tk.LEFT, padx=6)
         ttk.Button(topframe, text="Stop Sync Selected", command=lambda: self.stop_sync(selected_only=True)).pack(side=tk.LEFT)
 
-        # try:
-        #     tk.Label(topframe, text="Filter by status:").pack(side="left", padx=5)
-
-        #     self.status_filter = tk.StringVar(value="all")
-        #     status_options = ["all", "pending", "downloading", "completed", "error"]
-
-        #     ttk.OptionMenu(topframe, self.status_filter, "all", *status_options,
-        #                 command=lambda _: self.filter_by_status(self.status_filter.get())
-        #     ).pack(side="left", padx=5)
-        # except Exception as e:
-        #     self.queue.put(("log", f"error during filter: {e}"))
-
         # Treeview
         cols = ("s3_folder", "local_folder", "progress", "action")
         self.tree = ttk.Treeview(parent, columns=cols, show="headings", height=15)
@@ -886,25 +787,6 @@ class S3SyncApp(tk.Tk):
             
             self.open_folder(full_path)
 
-    # def on_click(self, event):
-    #     """Toggle checkbox on single-click in checkbox column."""
-    #     region = self.tree.identify("region", event.x, event.y)
-    #     if region != "cell":
-    #         return
-    #     col = self.tree.identify_column(event.x)
-    #     row = self.tree.identify_row(event.y)
-    #     if not row:
-    #         return
-    #     col_num = int(col.replace("#",""))
-    #     if col_num == 1:
-    #         prefix = self.tree.item(row, "values")[1]
-    #         item_selected = self.prefix_rows[prefix]["item_selected"]
-    #         item_selected = not item_selected
-    #         self.prefix_rows[prefix]["item_selected"] = item_selected
-    #         new_text = "[✓]" if item_selected else "[   ]"
-    #         self.tree.set(row, "item_selected", new_text)
-
-
     def open_folder(self, path):
         if not os.path.exists(path):
             messagebox.showerror("Error", f"Folder does not exist:\n{path}")
@@ -961,40 +843,6 @@ class S3SyncApp(tk.Tk):
             results = []
             for pref in prefixes:
                 try:
-                    # default_local = pref.rstrip("/").split("/")[-1] or pref.rstrip("/")
-                    # keys = list_objects_for_prefix(self, s3_client, self.cfg["bucket_name"], pref)
-                    # total = len(keys)
-
-                    # # Check for CSV and parse it here (background thread) to avoid blocking UI
-                    # csv_key = get_csv_for_prefix(s3_client, self.cfg["bucket_name"], pref)
-                    # csv_parsed = False
-                    # csv_parse_data = []
-                    # mappings = []
-                    # local_name = default_local
-
-                    # if csv_key:
-                    #     try:
-                    #         csv_parse_data = self.parse_csv_from_s3(self.cfg["bucket_name"], s3_client, csv_key)
-                    #         if csv_parse_data:
-                    #             csv_first_row = csv_parse_data[0]
-                    #             mappings = build_mappings_list(self, csv_parse_data)
-                    #             if mappings:
-                    #                 total = len(mappings)
-                    #             # derive local_name from csv first row (if present)
-                    #             local_name = get_local_name(csv_first_row, default_local)
-                    #             csv_parsed = True
-                    #     except Exception as e:
-                    #         # log parse error but continue
-                    #         tb = traceback.format_exc()
-                    #         self.queue.put(("log", f"[{pref}] CSV parse error: {e}\n{tb}"))
-
-                    # results.append({
-                    #     "prefix": pref,
-                    #     "default_local": local_name,
-                    #     "total": total,
-                    #     "csv_parsed": csv_parsed,
-                    #     "filter_file_mappings": mappings
-                    # })
                     result = get_result_object(self, pref, s3_client)
                     results.append(result)
                 except Exception as e:
@@ -1046,29 +894,12 @@ class S3SyncApp(tk.Tk):
                 self.update_tree_status(prefix)
                 self.update_tree_progress(prefix)
 
-        self.log(f"Refreshed list: {len(result)} prefixes.")
+        self.log(f"Refreshed list: {len(result)} folders.")
         self.progress.stop()
         self.progress.config(mode="determinate", maximum=100, value=100)
         self.status.config(text="Done!")
 
     # ---- Sync logic ----
-    # def filter_by_status(self, status: str):
-    #     """Filter Treeview rows by status ('all', 'pending', 'downloading', 'completed', 'error')."""
-        
-        # Clear all current rows in Treeview
-        # for iid in self.tree.get_children():
-        #     self.tree.delete(iid)
-
-        # # Re-insert only the rows that match the filter
-        # for pref, row in self.prefix_rows.items():
-        #     if status == "all" or row["status"] == status:
-        #         values = (pref, row["local_name"], f"{row['downloaded']}/{row['total']}")
-        #         item = self.tree.insert("", "end", values=values)
-                
-        #         # keep reference to the new item ID
-        #         self.prefix_rows[pref]["item"] = item
-
-
     def start_sync(self, selected_only=True):
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showwarning("Worker running", "Sync already running.")
@@ -1098,6 +929,7 @@ class S3SyncApp(tk.Tk):
                 if sync_status != "completed":
                     prefixes.append(p)
 
+        self.log(f"Syncing Started for : {len(prefixes)} folders.")
         # compute totals before starting: count objects per prefix
         try:
             self.s3_client = make_s3_client(self.cfg)
@@ -1108,8 +940,6 @@ class S3SyncApp(tk.Tk):
         # Reset counters
         for p in prefixes:
             self.prefix_rows[p]["downloaded"] = 0
-            # self.prefix_rows[p]["item_selected"] = False
-            # self.prefix_rows[p]["total"] = 0
             self.prefix_rows[p]["status"] = "pending"
             self.update_tree_progress(p)
             self.stop_flags[p] = False
@@ -1160,17 +990,7 @@ class S3SyncApp(tk.Tk):
                         continue
                 self.queue.put(("log", f"[{pref}] Pending."))
                 self.queue.put(("status", pref, "pending"))
-            #     try:
-            #         keys = list_objects_for_prefix(s3_client, bucket, pref)
-            #         total = len(keys)
-            #         self.prefix_rows[pref]["total"] = total
-            #         # push initial update
-            #         self.queue.put(("set_total", pref, total))
-            #         self.queue.put(("status", pref, "pending"))
-            #         self.log(f"[{pref}] total files: {total}")
-            #     except Exception as e:
-            #         self.queue.put(("log", f"[{pref}] worker_sync error counting objects: {e}"))
-            #         self.queue.put(("set_total", pref, 0))
+        
             # Now download per prefix
             for pref in prefixes:
                 if self.stop_event.is_set():
@@ -1241,13 +1061,16 @@ class S3SyncApp(tk.Tk):
                     self.queue.put(("log", f"[{pref}] Completed."))
                     self.queue.put(("status", pref, "completed"))
                 else:
-                    self.save_s3_sync_folder_status(pref, True)
                     if not self.stop_event.is_set() and not self.stop_flags.get(pref, False):
-                        self.queue.put(("log", f"[{pref}] Parital Done."))
-                        self.queue.put(("status", pref, "paritaldone"))
-                    else:
-                        self.queue.put(("log", f"[{pref}] Skipped."))
-                        self.queue.put(("status", pref, "skipped"))
+                        if downloaded > 0:
+                            self.queue.put(("log", f"[{pref}] Parital Done."))
+                            self.queue.put(("status", pref, "paritaldone"))
+                        else:
+                            self.queue.put(("log", f"[{pref}] Skipped."))
+                            self.queue.put(("status", pref, "skipped"))
+                    else: 
+                        self.queue.put(("log", f"[{pref}] Stopped."))
+                        self.queue.put(("status", pref, "stopped"))
 
 
             self.queue.put(("log", "All sync tasks completed."))
@@ -1259,32 +1082,6 @@ class S3SyncApp(tk.Tk):
             self.queue.put(("log", f"Worker error: {e}\n{tb}"))
         finally:
             self.queue.put(("done",))
-
-    # def parse_csv(self, file_path):
-    #     """
-    #     Parse CSV into a list of dicts.
-    #     Column headers are normalized: spaces & special characters -> '_'
-    #     """
-    #     rows = []
-    #     with open(file_path, newline='', encoding="utf-8") as csvfile:
-    #         reader = csv.DictReader(csvfile)
-
-    #         # Normalize headers
-    #         reader.fieldnames = [
-    #             re.sub(r'[^0-9a-zA-Z]+', '_', field.strip()).lower()
-    #             for field in reader.fieldnames
-    #         ]
-
-    #         for row in reader:
-    #             # Normalize keys in each row too
-    #             cleaned_row = {
-    #                 re.sub(r'[^0-9a-zA-Z]+', '_', k.strip()).lower(): v.strip()
-    #                 for k, v in row.items()
-    #             }
-    #             rows.append(cleaned_row)
-    #             self.queue.put(("log", "status : "+cleaned_row))
-
-    #     return rows
 
     def parse_csv_from_s3(self, bucket_name, s3client, key, first_only: bool=False):
 
