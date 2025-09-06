@@ -53,4 +53,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: pnm_s3_sync
-        path: dist/PNM-Filmhub-S3Sync.exe
+        path: dist/PNM-S3Sync.exe
