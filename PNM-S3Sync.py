@@ -1,5 +1,5 @@
 """
-PNM-Filmhub-S3Sync.py
+PNM-S3Sync.py
 Windows-only Python desktop app (Tkinter) for listing top-level S3 prefixes and syncing them
 to a local target path. Uses boto3.
 
@@ -10,11 +10,11 @@ Requirements:
     pip install pandas
 
 How to run (on Windows):
-    python3 PNM-Filmhub-S3Sync.py
+    python3 PNM-S3Sync.py
 
 To build .exe (on Windows) with PyInstaller:
     pip install pyinstaller
-    pyinstaller --onefile --windowed PNM-Filmhub-S3Sync.py
+    pyinstaller --onefile --windowed PNM-S3Sync.py
 """
 
 import os
@@ -22,7 +22,7 @@ import sys
 import subprocess
 import json
 import csv 
-import pandas as pd
+
 import re
 import threading
 import queue
@@ -33,7 +33,27 @@ from botocore.exceptions import ClientError, NoCredentialsError, BotoCoreError
 import tkinter as tk
 from tkinter import ttk, filedialog, simpledialog, messagebox, scrolledtext
 from pathlib import Path
+import importlib
+from s3_utils import list_objects_for_prefix
 
+
+DEFAULT_CONFIG = {
+    "target_path": "",
+    "aws_access_key_id": "",
+    "aws_secret_access_key": "",
+    "endpoint_url": "",
+    "region_name": "",
+    "bucket_name": "",
+    "include_mp4": True,
+    "sync_method": "FilmHub CSV"
+}
+
+
+# Map method → module name
+all_modules = {
+    "normal": "normal",
+    "csv": "filmhub_csv"
+}
 
 # ---------- Config handling ----------
 def get_app_location():
@@ -57,22 +77,6 @@ def get_config_path():
     os.makedirs(config_location, exist_ok=True)
     return os.path.join(config_location,"pnm_s3_sync_config.json")
 
-def get_sync_status_path():
-    base_location = get_app_location()
-    config_location = os.path.join(base_location, "config")
-    os.makedirs(config_location, exist_ok=True)
-    return os.path.join(config_location,"pnm_s3_sync_status.json")
-
-DEFAULT_CONFIG = {
-    "target_path": "",
-    "aws_access_key_id": "",
-    "aws_secret_access_key": "",
-    "endpoint_url": "",
-    "region_name": "",
-    "bucket_name": "",
-    "include_mp4": True
-}
-
 def load_config():
     path = get_config_path()
     if os.path.exists(path):
@@ -85,6 +89,22 @@ def load_config():
         except Exception:
             return DEFAULT_CONFIG.copy()
     return DEFAULT_CONFIG.copy()
+
+def save_config(cfg):
+    path = get_config_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+# ---------- Last Sync Status handling ----------
+def get_sync_status_path():
+    base_location = get_app_location()
+    config_location = os.path.join(base_location, "config")
+    os.makedirs(config_location, exist_ok=True)
+    return os.path.join(config_location,"pnm_s3_sync_status.json")
 
 def load_sync_status():
     path = get_sync_status_path()
@@ -99,15 +119,6 @@ def load_sync_status():
             return {}
     return {}
 
-def save_config(cfg):
-    path = get_config_path()
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-        return True
-    except Exception:
-        return False
-
 def save_sync_status(cfg):
     path = get_sync_status_path()
     try:
@@ -116,6 +127,25 @@ def save_sync_status(cfg):
         return True
     except Exception:
         return False
+
+# ---------- Load Module handling ----------
+def load_module(self):
+        """Load the sync module dynamically."""
+        print("self.cfg ",self.cfg)
+        # Import or reload
+        if self.cfg["sync_method"] == "FilmHub CSV":
+            self.sync_module_name = "filmhub_csv"
+        elif self.cfg["sync_method"] == "Normal":
+            self.sync_module_name = "normal"
+        
+        for m in all_modules:
+            if m != self.sync_module_name and m in sys.modules:
+                del sys.modules[m]
+
+        # Import the selected module
+        self.sync_module = importlib.import_module(self.sync_module_name)
+        print("Loaded sync_module_name : ", self.sync_module_name)
+        self.queue.put(("log", f"Loaded sync_module_name : {self.sync_module_name}"))
 
 # ---------- S3 helpers ----------
 def make_s3_client(cfg):
@@ -146,320 +176,6 @@ def list_top_level_prefixes(s3_client, bucket):
     except ClientError as e:
         raise
 
-def list_objects_for_prefix(self, s3_client, bucket, prefix):
-    """Return list of object keys under a prefix (recursive)."""
-    keys = []
-    paginator = s3_client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        contents = page.get("Contents") or []
-        for obj in contents:
-            # skip "folder objects" that equal prefix (optional)
-            key = obj.get("Key")
-            if key:
-                # Skip "folders" (keys ending with '/')
-                if key.endswith("/"):
-                    continue
-
-                if key.endswith(".mp4") and not self.cfg["include_mp4"]:
-                    continue
-
-                # 🚨 Skip hidden files/folders (start with a dot after the prefix)
-                relative_path = os.path.relpath(key, prefix)
-                if relative_path.startswith("."):
-                    continue
-
-                keys.append(key)
-    return keys
-
-def get_csv_for_prefix(s3_client, bucket, prefix):
-    """Return list of object keys under a prefix (recursive)."""
-    paginator = s3_client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        contents = page.get("Contents") or []
-        for obj in contents:
-            # skip "folder objects" that equal prefix (optional)
-            key = obj.get("Key")
-            if key:
-                # Skip "folders" (keys ending with '/')
-                if key.endswith("/"):
-                    continue
-
-                # 🚨 Skip hidden files/folders (start with a dot after the prefix)
-                relative_path = os.path.relpath(key, prefix)
-                if relative_path.startswith("."):
-                    continue
-                
-                if key.endswith(".csv"):
-                    return key
-    return None
-
-def normalize_title(self, text: str, seperator: str='.') -> str:
-    """
-    Normalize a single column name with custom rules:
-    - Convert to lowercase
-    - Remove apostrophes (colons like Star's -> Stars)
-    - Replace spaces and special characters (excluding parentheses) with '.'
-    - Collapse multiple '..' into single '.'
-    - Strip leading/trailing '.'
-    """
-    s = text
-
-    if self.cfg["sync_method"] == "FilmHub CSV":
-       s = normalize_title_filmhub(text, seperator)
-    else:
-       s = normalize_title_normal(text)
-
-    return s
-
-def normalize_title_filmhub(text: str, seperator: str='.') -> str:
-    """
-    Normalize a single column name with custom rules:
-    - Convert to lowercase
-    - Remove apostrophes (colons like Star's -> Stars)
-    - Replace spaces and special characters (excluding parentheses) with '.'
-    - Collapse multiple '..' into single '.'
-    - Strip leading/trailing '.'
-    """
-    s = str(text).strip().lower()
-
-    # Remove apostrophes
-    s = s.replace("'", "")
-
-    # Replace all special chars (except parentheses) with '.'
-    s = re.sub(r'[^0-9a-z()]+', seperator, s)
-
-    # Collapse multiple dots
-    s = re.sub(r'\.+', seperator, s)
-
-    # Remove leading/trailing dots
-    s = s.strip('.')
-
-    return s
-
-def normalize_title_normal(text: str) -> str:
-    return text
-
-def get_local_name(self, csv_first_row: str, default_localname: str) -> str:
-    s = ""
-    if self.cfg["sync_method"] == "FilmHub CSV":
-       s = get_local_name_filmhub(self, csv_first_row, default_localname)
-    else:
-       s = get_local_name_normal(default_localname)
-
-    return s
-
-def get_local_name_filmhub(self, csv_first_row, default_local) -> str:
-    s = normalize_title(self, csv_first_row.get("movie_show_title", default_local)) + ".(" + normalize_title(self, str(csv_first_row.get("production_year", ""))) + ")"
-
-    return s
-
-def get_local_name_normal(text: str) -> str:
-    return text
-
-
-def normalize_cols(self, cols, seperator) -> list:
-    """
-    Normalize a list of column names
-    """
-    return [normalize_title(self, c, seperator) for c in cols]
-
-def extract_language(filename: str) -> str:
-    """
-    Try to extract language code from subtitle filename (e.g. '_en.srt' -> 'en').
-    Defaults to 'und' (undefined) if not found.
-    """
-    match = re.search(r"_([a-z]{2,3})\.srt$", filename)
-    return match.group(1) if match else "und"
-
-def build_mappings_list(self, pref, rows: list) -> list:
-    mappings = []
-    if self.cfg["sync_method"] == "FilmHub CSV":
-        mappings = build_mappings_filmhub(self, rows)
-    else:
-        mappings = build_mappings_normal(self, pref, rows)
-
-    return mappings
-
-def build_mappings_filmhub(self, rows: list) -> list:
-    """
-    Build mappings for multiple CSV rows.
-    Each row is a dict of metadata.
-    Returns a list of unique {original, new} mappings.
-    """
-    mappings = []
-    seen = set()  # keep track of unique originals
-    
-
-    for row in rows:
-        # --- Movie ---
-        lang_seen = set()  # keep track of unique originals
-        if row.get("program_type", "").lower() == "movie":
-            title = row.get("movie_show_title", "")
-           
-            year = row.get("production_year", "")
-            base = normalize_title(self, f"{title}.({year})")
-
-            # Film
-            original = row.get("movie_filename", "")
-           
-            if original and self.cfg["include_mp4"] and original not in seen:
-                mappings.append({"original": original, "new": f"{base}.mp4"})
-                seen.add(original)
-
-            # Trailer
-            trailer = row.get("trailer_filename", "")
-            if trailer and self.cfg["include_mp4"] and trailer not in seen:
-                mappings.append({"original": trailer, "new": f"{base}-trailer.mp4"})
-                seen.add(trailer)
-
-            # Posters
-            for key, suffix in [
-                ("key_art_16_9_filename", "-poster.(16x9).jpg"),
-                ("key_art_2_3_filename", "-poster.(2x3).jpg"),
-                ("key_art_3_4_filename", "-poster.(3x4).jpg"),
-            ]:
-                original = row.get(key, "")
-                if original and original not in seen:
-                    mappings.append({"original": original, "new": f"{base}{suffix}"})
-                    seen.add(original)
-
-            # Subtitles (comma-separated list)
-            subs = row.get("movie_subtitles_captions_filenames", "")
-            for sub in [s.strip() for s in subs.split(",") if s.strip()]:
-                if sub not in seen:
-                    lang = extract_language(sub)
-                    mappings.append({"original": sub, "new": f"{base}.{lang}.srt"})
-                    seen.add(sub)
-
-
-        # --- Series ---
-        elif row.get("program_type", "").lower() == "show":
-            series = row.get("movie_show_title", "")
-            year = row.get("production_year", "")
-            ep_title = row.get("episode_name", "")
-            season = int(row.get("season_number", 0))
-            episode = int(row.get("episode_number", 0))
-
-            series_base = normalize_title(self, f"{series}.({year})")
-            ep_base = (
-                f"{series_base}.s{season:02d}e{episode:02d}."
-                f"{normalize_title(self, ep_title)}"
-            )
-
-            # Film
-            original = row.get("episode_filename", "")
-            if original and self.cfg["include_mp4"] and original not in seen:
-                mappings.append({"original": original, "new": f"{ep_base}.mp4"})
-                seen.add(original)
-
-            # Trailer
-            trailer = row.get("trailer_filename", "")
-            if trailer and self.cfg["include_mp4"] and trailer not in seen:
-                mappings.append({"original": trailer, "new": f"{series_base}-trailer.mp4"})
-                seen.add(trailer)
-
-            # Episode Posters
-            for key, suffix in [
-                ("key_art_16_9_filename", "-poster.(16x9).jpg"),
-                ("key_art_2_3_filename", "-poster.(2x3).jpg"),
-                ("key_art_3_4_filename", "-poster.(3x4).jpg"),
-            ]:
-                original = row.get(key, "")
-                if original and original not in seen:
-                    mappings.append({"original": original, "new": f"{ep_base}{suffix}"})
-                    seen.add(original)
-
-            # Subtitles
-            subs = row.get("episode_subtitles_captions_filenames", "")
-            for sub in [s.strip() for s in subs.split(",") if s.strip()]:
-                if sub not in seen:
-                    lang = extract_language(sub)
-                    if lang not in lang_seen:
-                        mappings.append({"original": sub, "new": f"{ep_base}.{lang}.srt"})
-                        seen.add(sub)
-                        lang_seen.add(lang)
-
-    return mappings
-
-def build_mappings_normal(self, pref, keys: list) -> list:
-    mappings = []
-    for key in keys:
-        rel = key[len(pref):] if key.startswith(pref) else key
-        if rel.endswith(".mp4") and not self.cfg["include_mp4"]:
-            continue
-        mappings.append({"original": rel, "new": rel})
-
-    return mappings
-
-
-def get_result_object(self, pref, s3_client) -> dict:
-    result = {}
-    if self.cfg["sync_method"] == "FilmHub CSV":
-        mappings = get_result_object_filmhub(self, pref, s3_client)
-    else:
-        mappings = get_result_object_normal(self, pref, s3_client)
-
-    return mappings
-
-def get_result_object_filmhub(self, pref, s3_client) -> dict:
-    default_local = pref.rstrip("/").split("/")[-1] or pref.rstrip("/")
-    keys = list_objects_for_prefix(self, s3_client, self.cfg["bucket_name"], pref)
-    total = len(keys)
-    csv_key = get_csv_for_prefix(s3_client, self.cfg["bucket_name"], pref)
-    data_parsed = False
-    csv_parse_data = []
-    mappings = []
-    local_name = default_local
-
-    if csv_key:
-        try:
-            csv_parse_data = self.parse_csv_from_s3(self.cfg["bucket_name"], s3_client, csv_key)
-            if csv_parse_data:
-                csv_first_row = csv_parse_data[0]
-                mappings = build_mappings_list(self, pref, csv_parse_data)
-                if mappings:
-                    total = len(mappings)
-                # derive local_name from csv first row (if present)
-                local_name = get_local_name(self, csv_first_row, default_local)
-                data_parsed = True
-        except Exception as e:
-            # log parse error but continue
-            tb = traceback.format_exc()
-            self.queue.put(("log", f"[{pref}] CSV parse error: {e}\n{tb}"))
-
-    result = {
-        "prefix": pref,
-        "default_local": local_name,
-        "total": total,
-        "data_parsed": data_parsed,
-        "filter_file_mappings": mappings
-    }
-    return result
-
-def get_result_object_normal(self, pref, s3_client) -> dict:
-    default_local = pref.rstrip("/").split("/")[-1] or pref.rstrip("/")
-    keys = list_objects_for_prefix(self, s3_client, self.cfg["bucket_name"], pref)
-    total = len(keys)
-
-    # Check for CSV and parse it here (background thread) to avoid blocking UI
-    data_parsed = False
-    csv_parse_data = []
-    mappings = []
-    local_name = default_local
-    mappings = build_mappings_list(self, pref, keys)
-    if mappings:
-        data_parsed = True
-        total = len(mappings)
-    
-    result = {
-        "prefix": pref,
-        "default_local": local_name,
-        "total": total,
-        "data_parsed": data_parsed,
-        "filter_file_mappings": mappings
-    }
-    return result
-
 def find_mapping(mappings: list, original_filename: str) -> dict | None:
     """
     Find a mapping entry by its original filename.
@@ -476,19 +192,24 @@ class S3SyncApp(tk.Tk):
         super().__init__()
         self.title("PNM FilmHub S3 Sync App")
         self.geometry("1100x600")
+        self.sync_module = None
+        self.sync_module_name = None
 
+        self.queue = queue.Queue()
+        self.poll_queue()
         self.cfg = load_config()
+        load_module(self)
         self.sync_status = load_sync_status()
         self.s3_client = None
 
-        self.queue = queue.Queue()
+
         self.stop_flags = {}
         self.worker_thread = None
         self.stop_event = threading.Event()
-        self.poll_queue()
 
         self.create_widgets()
 
+    # ---- Create Main APP Widget UI ----
     def create_widgets(self):
         # Notebook with two tabs
         nb = ttk.Notebook(self)
@@ -513,7 +234,7 @@ class S3SyncApp(tk.Tk):
             # config ok → open Listing
             nb.select(self.listing_frame)
        
-    # ---- Settings UI ----
+    # ---- Settings Page UI ----
     def build_settings(self, parent):
         pad = 6
         frm = ttk.Frame(parent)
@@ -565,7 +286,6 @@ class S3SyncApp(tk.Tk):
         self.sync_method_var = tk.StringVar(value=self.sync_method_value)
         sync_method_options = ["FilmHub CSV", "Normal"]
        
-
         self.sync_method_dropdown = ttk.OptionMenu(frm, self.sync_method_var, self.sync_method_var.get(), *sync_method_options)
 
         self.sync_method_dropdown.grid(row=7, column=1, columnspan=2, sticky=tk.W)
@@ -613,6 +333,7 @@ class S3SyncApp(tk.Tk):
             self.sync_method_dropdown.state(["!disabled"])
         ok = save_config(self.cfg)
         if ok:
+            load_module(self)
             messagebox.showinfo("Saved", "Configuration saved.")
             # update s3 client
             self.s3_client = None
@@ -631,9 +352,9 @@ class S3SyncApp(tk.Tk):
         else:
             self.queue.put(("log", f"Failed to save status set for {key} --> ${value}"))
 
-
     def reload_config(self):
         self.cfg = load_config()
+        load_module(self)
         self.target_path_var.set(self.cfg.get("target_path", ""))
         self.aws_access_var.set(self.cfg.get("aws_access_key_id", ""))
         self.region_var.set(self.cfg.get("region_name", ""))
@@ -679,7 +400,7 @@ class S3SyncApp(tk.Tk):
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    # ---- Listing / Sync UI ----
+    # ---- Listing / Sync Page UI ----
     def build_listing(self, parent):
         topframe = ttk.Frame(parent)
         topframe.pack(fill=tk.X, padx=8, pady=8)
@@ -843,7 +564,7 @@ class S3SyncApp(tk.Tk):
             results = []
             for pref in prefixes:
                 try:
-                    result = get_result_object(self, pref, s3_client)
+                    result = self.sync_module.get_result_object(self, pref, s3_client)
                     results.append(result)
                 except Exception as e:
                     tb = traceback.format_exc()
@@ -1083,64 +804,6 @@ class S3SyncApp(tk.Tk):
         finally:
             self.queue.put(("done",))
 
-    def parse_csv_from_s3(self, bucket_name, s3client, key, first_only: bool=False):
-
-        try:
-            obj = s3client.get_object(Bucket=bucket_name, Key=key)
-            df = pd.read_csv(obj["Body"], dtype=str, keep_default_na=False, index_col=False) # Reads directly from S3 response body
-
-            if df.empty:
-                return [] if not first_only else None
-             # Normalize headers
-            df.columns = normalize_cols(self, df.columns, '_')
-            # Trim spaces
-            # df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
-            df = df.apply(lambda col: col.map(lambda x: x.strip() if isinstance(x, str) else x))
-
-            records = []
-            for _, row in df.iterrows():
-                rec = row.to_dict()
-
-                # ✅ Always force first column value as template_description
-                first_col = df.columns[0]
-                records.append(rec)
-
-            return (records[0] if (first_only and records) else records)
-
-        except Exception as e:
-            tb = traceback.format_exc()
-            self.queue.put(("log", f"parse_csv_from_s3 error : {e}\n{tb}"))
-            return [] if not first_only else None
-
-    def parse_csv(self, file_path):
-        data = []
-        with open(file_path, newline='', encoding='utf-8') as csvfile:
-            reader = csv.DictReader(csvfile)
-            # Sanitize headers: replace spaces/special chars with underscores
-            reader.fieldnames = [re.sub(r'\W+', '_', h.strip()) for h in reader.fieldnames]
-
-            for row in reader:
-                clean_row = {}
-                for k, v in row.items():
-
-                    if isinstance(k, str):
-                        clean_key = re.sub(r"[^0-9a-zA-Z]+", "_", k.strip().lower())
-                    else:
-                        clean_key = str(k).lower()
-
-                    # Normalize value
-                    if v is None:
-                        v = ""
-                    elif isinstance(v, list):  
-                        v = ",".join(map(str, v))  # flatten list into CSV-safe string
-                    else:
-                        v = str(v)  # force everything into string
-                    
-                    clean_row[clean_key] = v.strip()
-                self.queue.put(("log", f"Status : ${json.dumps(clean_row)}"))
-                data.append(clean_row)
-        return data
-
     def update_tree_progress(self, prefix):
         info = self.prefix_rows.get(prefix)
         if not info:
@@ -1217,6 +880,8 @@ def main():
     except Exception as e:
         with open("error.log", "a") as f:
             f.write(traceback.format_exc())
+            tb = traceback.format_exc()
+            print("Main error: ",e , " \n",tb)
 
 if __name__ == "__main__":
     main()
