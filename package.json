@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "build":  "pyinstaller PNM-Filmhub-S3Sync.spec --noconfirm",
+    "build":  "pyinstaller PNM-S3Sync.spec --noconfirm",
     "treeview": "pyinstaller --onefile --windowed tree_checkbox.py --noconfirm",
     "loader": "pyinstaller --onefile --windowed loader.py --noconfirm",
     "open": "open dist/PNM"
